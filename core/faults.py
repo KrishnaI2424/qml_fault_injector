@@ -1,7 +1,8 @@
 import numpy as np
 import pennylane as qml
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Callable
+from typing import List, Optional, Dict, Callable, Tuple
+import functools
 import itertools
 import warnings
 
@@ -12,6 +13,28 @@ _CHANNELS = {
     "bit_flip":   (qml.BitFlip,   qml.PauliX),
     "phase_flip": (qml.PhaseFlip, qml.PauliZ),
 }
+
+
+@dataclass
+class FaultRealization:
+    """One sampled Pauli fault pattern, held fixed for one optimizer step.
+
+    ``fired`` lists which channel from ``_CHANNELS`` fired on which of the
+    config's target wires: e.g. ``[("bit_flip", 0), ("bit_flip", 3)]``.
+    """
+    step_index: int
+    fired: List[Tuple[str, int]]
+
+    def pauli_ops(self):
+        """Materialise the realized faults as non-parameterized Pauli gates."""
+        return [_CHANNELS[name][1](wires=w) for name, w in self.fired]
+
+    def as_dict(self):
+        """JSON-safe representation for logging."""
+        return {
+            "step_index": self.step_index,
+            "fired": [[name, int(w)] for name, w in self.fired],
+        }
 
 
 @dataclass
@@ -47,9 +70,30 @@ class FaultConfig:
             ) if p > 0.0
         }
 
+    @classmethod
+    def no_faults(cls, name="baseline", **kwargs):
+        """A fault-free config.
+
+        ``training_session()`` on it produces a stepper that injects nothing —
+        behaviorally identical to a bare ``opt.step`` loop (verified by
+        ``test_zero_probability_matches_unwrapped_baseline_exactly``). Use it as
+        the no-fault default so plain and faulted training share one abstraction.
+
+        Probabilities are already zero by default, so this is a self-documenting
+        convenience. Extra kwargs (e.g. ``target_wires``, ``insert_after``) pass
+        through for callers who want a placeholder they can later flip on.
+        """
+        return cls(name=name, bit_flip_p=0.0, phase_flip_p=0.0, **kwargs)
+
     def apply_classical_faults(self, weights):
-        """No classical faults in this version — pass through cleanly."""
-        return np.asarray(weights).copy()
+        """No classical faults in this version — pass through cleanly.
+
+        The input is returned untouched: converting via ``np.asarray(...).copy()``
+        would strip autograd tracking from trainable tensors (pennylane.numpy,
+        torch, jax). Any future perturbation must use ``qml.math`` operations so
+        trainable tensor types are preserved.
+        """
+        return weights
 
     # ------------------------------------------------------------------ #
     #  Public entry point
@@ -70,6 +114,19 @@ class FaultConfig:
             raise ValueError(
                 f"Unknown mode: {self.mode!r}. Use 'exact' or 'stochastic'."
             )
+
+    def training_session(self, qnode, device_name=None):
+        """Return a :class:`FaultTrainingSession` for per-step fault injection.
+
+        Unlike ``wrap_circuit`` (which targets inference on trained models),
+        the session draws ONE fault realization per optimizer step and holds
+        it fixed across every QNode evaluation within that step — all batch
+        points and parameter-shift evaluations see the same Pauli pattern.
+
+        ``device_name=None`` keeps the QNode's own device; pass e.g.
+        ``"default.mixed"`` to train on a different simulator.
+        """
+        return FaultTrainingSession(self, qnode, device_name=device_name)
 
     # ------------------------------------------------------------------ #
     #  Helpers
@@ -209,3 +266,112 @@ class FaultConfig:
           return state["caller"](*a, **k)
 
       return dispatch
+
+
+class FaultTrainingSession:
+    """Per-step fixed-sample fault injection during training (autograd path).
+
+    One :class:`FaultRealization` is drawn per optimizer step (``new_step``)
+    and applied at QNode call time by splicing the realized Pauli gates into
+    the tape as non-parameterized constants, so every evaluation within one
+    step — all batch points and all parameter-shift/backprop evaluations —
+    sees the same fixed pattern.
+
+    Contract for ``step``: the user's cost function accepts the wrapped QNode
+    as its FIRST parameter (``cost(qnode, *trainable_and_data_args)``) rather
+    than closing over a module-level circuit.
+
+    TODO: JAX/jit mask-parameterization backend. Under ``jax.jit`` the tape
+    cannot be re-spliced per step; the plan is to parameterize the fault layer
+    with a static-shape 0/1 mask array (one slot per target-wire/channel
+    event) baked into the circuit, updating only the mask values each step.
+    Not implemented yet — constructing a session from a JAX-interface QNode
+    raises ``NotImplementedError``.
+    """
+
+    def __init__(self, config, qnode, device_name=None):
+        interface = str(getattr(qnode, "interface", "auto"))
+        if "jax" in interface:
+            raise NotImplementedError(
+                "FaultTrainingSession only supports the autograd path for now; "
+                "the JAX/jit mask-parameterization backend is not implemented yet."
+            )
+
+        self.config = config
+        self.recorder = None  # set below; import here would be circular at module load
+
+        # Rebuild the QNode onto the training device exactly once, preserving
+        # the original interface, diff_method, and wire labels.
+        dev_name = device_name or qnode.device.name
+        dev = qml.device(dev_name, wires=list(qnode.device.wires))
+        rebuilt = qml.QNode(
+            qnode.func, dev,
+            interface=qnode.interface,
+            diff_method=qnode.diff_method,
+        )
+
+        self._target_wires = config._resolve_target_wires(rebuilt)
+        # Same event structure as _wrap_stochastic._build_events, resolved
+        # against the config rather than the tape (sampling happens before any
+        # circuit call). Wires absent from the tape are skipped at splice time.
+        self._events = [
+            (w, name, p)
+            for w in self._target_wires
+            for name, p in config._active_channels().items()
+        ]
+        self._rng = np.random.default_rng(config.seed)
+        self._step_count = 0
+        self._current: Optional[FaultRealization] = None
+
+        session = self
+        insert_idx_fn = config._insertion_index
+
+        @qml.transform
+        def _apply_realization(tape):
+            ops = list(tape.operations)
+            present = set(tape.wires)
+            idx = insert_idx_fn(len(ops))
+            fault_ops = []
+            if session._current is not None:
+                for name, w in session._current.fired:
+                    if w not in present:
+                        warnings.warn(
+                            f"target wire {w} is not used by the circuit; "
+                            f"no fault injected there.", stacklevel=2,
+                        )
+                        continue
+                    fault_ops.append(_CHANNELS[name][1](wires=w))
+            new_ops = ops[:idx] + fault_ops + ops[idx:]
+            new_tape = type(tape)(new_ops, tape.measurements, shots=tape.shots)
+            return [new_tape], lambda res: res[0]
+
+        self.qnode = _apply_realization(rebuilt)
+
+        from .recorder import ResultRecorder
+        self.recorder = ResultRecorder()
+
+    def new_step(self):
+        """Draw a fresh fault realization from the config RNG."""
+        fired = [(name, w) for (w, name, p) in self._events if self._rng.random() < p]
+        self._current = FaultRealization(step_index=self._step_count, fired=fired)
+        self._step_count += 1
+        return self._current
+
+    def step(self, opt, cost, *args, **kwargs):
+        """Draw a new realization, then delegate to the optimizer's step.
+
+        ``cost`` must take the wrapped QNode as its first parameter; it is
+        bound here so the optimizer differentiates only the remaining args.
+        Returns exactly what ``opt.step`` would. Uses ``step_and_cost`` when
+        the optimizer provides it, so the pre-update loss is logged without
+        extra circuit evaluations.
+        """
+        realization = self.new_step()
+        bound_cost = functools.partial(cost, self.qnode)
+        if hasattr(opt, "step_and_cost"):
+            new_args, loss = opt.step_and_cost(bound_cost, *args, **kwargs)
+        else:
+            new_args, loss = opt.step(bound_cost, *args, **kwargs), None
+        self.recorder.log_step(self.config, realization, loss,
+                               args[0] if args else None)
+        return new_args
