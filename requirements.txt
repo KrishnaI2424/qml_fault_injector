@@ -1,2 +1,4 @@
 pennylane
 numpy
+pennylane-lightning
+# pennylane-lightning-gpu   # needs a CUDA toolkit; install separately on GPU nodes
