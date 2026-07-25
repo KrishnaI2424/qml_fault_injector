@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qml_fault_injector"
+version = "0.1.0"
+description = "PennyLane-based wrapper for injecting quantum faults into QML models"
+authors = [{ name = "Krishna Iyer" }]
+readme = "qml_fault_injector/README.md"
+requires-python = ">=3.9"
+dependencies = ["pennylane", "numpy", "pennylane-lightning"]
+
+[project.optional-dependencies]
+gpu = ["pennylane-lightning-gpu"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["qml_fault_injector*"]
