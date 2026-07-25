@@ -5,5 +5,5 @@ __author__  = "Krishna Iyer"
 
 # from qml_fault_injector import inject
 from .core.wrapper import inject
-from .core.faults  import FaultConfig
+from .core.faults  import FaultConfig, FaultRealization, FaultTrainingSession
 from .core.recorder import ResultRecorder
