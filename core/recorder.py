@@ -1,6 +1,28 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import pennylane as qml
+
+from .faults import _CHANNELS
+
+
+def _active_channels(cfg):
+    """Active fault channels of a config, tolerating older configs."""
+    if hasattr(cfg, "_active_channels"):
+        return cfg._active_channels()
+    return {
+        name: p for name, p in (
+            ("bit_flip",   getattr(cfg, "bit_flip_p",   0.0)),
+            ("phase_flip", getattr(cfg, "phase_flip_p", 0.0)),
+        ) if p > 0.0
+    }
+
+
+def _insert_label(cfg):
+    """Human-readable description of where faults are inserted."""
+    k = getattr(cfg, "insert_after", None)
+    return "before measurement" if k is None else f"after op #{k}"
+
+
 class ResultRecorder:
     """Simple recorder to log injection results."""
     def __init__(self):
@@ -15,43 +37,55 @@ class ResultRecorder:
         }
         self.history.append(record)
         print("Result recorded.")
-    def affected_parameters(self, index=-1):
-        rec  = self.history[index]
-        cfg  = rec["config"]
-        w0   = np.asarray(rec["original_weights"])
-        wf   = np.asarray(rec["faulted_weights"])
 
-        diff = ~np.isclose(w0, wf, atol=1e-12)
-        n_changed = int(diff.sum())
+    def log_step(self, fault_config, realization, loss, weights):
+        """Log one record per optimizer step of a training session.
 
-        active_channels = {
-            ch: p for ch, p in [
-                ("bit_flip",   getattr(cfg, "bit_flip_p",   0.0)),
-                ("phase_flip", getattr(cfg, "phase_flip_p", 0.0)),
-                ("depolar",    getattr(cfg, "depolar_p",    0.0)),
-            ] if p > 0.0
+        Records are a superset of ``log()``'s shape, so ``summary()``,
+        ``plot_results()`` and ``affected_parameters()`` work on them
+        unchanged (``result`` holds the step's loss). Weights are unwrapped
+        to plain NumPy for JSON safety. Deliberately silent — one print per
+        step would drown a training run.
+        """
+        unwrapped = qml.math.unwrap(weights)
+        record = {
+            'config': fault_config,
+            'original_weights': unwrapped,
+            'faulted_weights': unwrapped,
+            'result': None if loss is None else float(loss),
+            'step': realization.step_index,
+            'realization': realization.as_dict(),
         }
+        self.history.append(record)
+
+    def affected_parameters(self, index=-1):
+        rec = self.history[index]
+        cfg = rec["config"]
+        w0  = np.asarray(rec["original_weights"])
 
         return {
-            "name":              cfg.name,
-            "target_wires":      cfg.target_wires if cfg.target_wires is not None else [0],
-            "active_channels":   active_channels,
-            "weight_shape":      w0.shape,
-            "weights_changed":   n_changed,
-            "weights_total":     w0.size,
-            "result":            rec["result"],
+            "name":            cfg.name,
+            "mode":            getattr(cfg, "mode", "exact"),
+            "target_wires":    cfg.target_wires,   # None -> resolved per-device at run time
+            "active_channels": _active_channels(cfg),
+            "insert_point":    _insert_label(cfg),
+            "weight_shape":    w0.shape,
+            "result":          rec["result"],
         }
 
     def print_affected_parameters(self, index=-1):
-        """Pretty-print the affected-parameter summary for one record."""
+        """Pretty-print the fault summary for one record."""
         info = self.affected_parameters(index)
+        wires = info["target_wires"]
         print(f"── Run: {info['name']} ──")
-        print(f"  Target wires    : {info['target_wires']}")
+        print(f"  Mode            : {info['mode']}")
+        print(f"  Target wires    : "
+              + (str(wires) if wires is not None else "auto (first device wire)"))
         print(f"  Active channels : "
               + (" ".join(f"{k}(p={v})" for k, v in info["active_channels"].items())
                  if info["active_channels"] else "none"))
+        print(f"  Insert point    : {info['insert_point']}")
         print(f"  Weight shape    : {info['weight_shape']}")
-        print(f"  Weights changed : {info['weights_changed']} / {info['weights_total']}")
         print(f"  Result          : {info['result']}")
 
     def summary(self):
@@ -59,18 +93,19 @@ class ResultRecorder:
         if not self.history:
             print("No runs recorded.")
             return
-        print(f"{'#':>3}  {'name':<14} {'wires':<10} {'channels':<32} {'result':>10}")
-        print("-" * 75)
+        print(f"{'#':>3}  {'name':<14} {'mode':<11} {'wires':<10} {'channels':<28} {'result':>12}")
+        print("-" * 84)
         for i, rec in enumerate(self.history):
             cfg = rec["config"]
-            chans = ", ".join(f"{k}={v}" for k, v in [
-                ("bf", cfg.bit_flip_p), ("pf", cfg.phase_flip_p), ("dp", cfg.depolar_p),
-            ] if v > 0.0) or "none"
-            wires = str(cfg.target_wires if cfg.target_wires is not None else [0])
+            chans = ", ".join(
+                f"{k}={v}" for k, v in _active_channels(cfg).items()
+            ) or "none"
+            wires = str(cfg.target_wires) if cfg.target_wires is not None else "auto"
+            mode  = getattr(cfg, "mode", "exact")
             res   = rec["result"]
-            res_s = f"{float(res):.4f}" if np.isscalar(res) or np.ndim(res) == 0 else f"shape{np.shape(res)}"
-            print(f"{i:>3}  {cfg.name:<14} {wires:<10} {chans:<32} {res_s:>10}")
-
+            res_s = (f"{float(res):.4f}" if np.ndim(res) == 0
+                     else f"shape{np.shape(res)}")
+            print(f"{i:>3}  {cfg.name:<14} {mode:<11} {wires:<10} {chans:<28} {res_s:>12}")
 
     def plot_wire_impact(self, figsize=(8, 4), save_path=None):
         """
@@ -84,11 +119,10 @@ class ResultRecorder:
 
         wire_counts = {}
         for rec in self.history:
-            cfg   = rec["config"]
+            cfg = rec["config"]
+            if not _active_channels(cfg):
+                continue  # baseline run, no faults
             wires = cfg.target_wires if cfg.target_wires is not None else [0]
-            # Skip the baseline run (no faults active)
-            if not any([cfg.bit_flip_p, cfg.phase_flip_p]):
-                continue
             for w in wires:
                 wire_counts[w] = wire_counts.get(w, 0) + 1
 
@@ -108,41 +142,78 @@ class ResultRecorder:
         plt.show()
         return fig
 
+    def plot_results(self, figsize=(8, 4), save_path=None):
+        """
+        Bar chart of the scalar result of every logged run, so faulted runs
+        can be compared against the baseline at a glance. Runs with
+        non-scalar results are skipped.
+        """
+        if not self.history:
+            print("No runs to plot.")
+            return
 
-    
-    def draw_circuit(self, qnode, x, index=-1, save_path=None):
-        import pennylane as qml
- 
-        rec    = self.history[index]
-        cfg    = rec["config"]
-        params = rec["faulted_weights"]
- 
-        # Reconstruct the faulted circuit inline so draw_mpl sees the
-        # noise channels exactly as they were injected at run time.
-        target_wires = cfg.target_wires if cfg.target_wires is not None else [0]
-        bit_flip_p   = getattr(cfg, "bit_flip_p",   0.0)
-        phase_flip_p = getattr(cfg, "phase_flip_p", 0.0)
-        original_func = qnode.func
- 
-        def faulted_func(params, x):
-            for wire in target_wires:
-                if bit_flip_p   > 0.0: qml.BitFlip(bit_flip_p,   wires=wire)
-                if phase_flip_p > 0.0: qml.PhaseFlip(phase_flip_p, wires=wire)
-            return original_func(params, x)
- 
-        drawable = qml.QNode(faulted_func, qnode.device)
-        fig, ax  = qml.draw_mpl(drawable)(params, x)
- 
-        ax.set_title(
-            f"Faulted circuit — {cfg.name}  "
-            + ", ".join(f"{k}(p={v})" for k, v in [
-                ("BitFlip",   bit_flip_p),
-                ("PhaseFlip", phase_flip_p)
-            ] if v > 0.0)
-        )
- 
+        names, values = [], []
+        for i, rec in enumerate(self.history):
+            if np.ndim(rec["result"]) != 0:
+                continue
+            names.append(f"{i}: {rec['config'].name}")
+            values.append(float(rec["result"]))
+
+        if not names:
+            print("No scalar results to plot.")
+            return
+
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.bar(names, values, color="#4C72B0")
+        ax.set_ylabel("result")
+        ax.set_title("Result per logged run")
+        plt.xticks(rotation=30, ha="right")
+        plt.tight_layout()
         if save_path:
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
             print(f"Saved figure to {save_path}")
         plt.show()
-        return fig, a
+        return fig
+
+    def draw_circuit(self, qnode, *args, index=-1, save_path=None, **kwargs):
+        """
+        Draw the faulted circuit for one logged run.
+
+        Rebuilds the tape the same way FaultConfig does — construct the
+        QNode's tape, then splice the exact channel ops in at the configured
+        insertion point — so the drawing matches what actually executed.
+        Extra ``*args``/``**kwargs`` are the circuit inputs after the weights
+        (e.g. the data sample ``x``).
+        """
+        rec    = self.history[index]
+        cfg    = rec["config"]
+        params = rec["faulted_weights"]
+
+        tape = qml.workflow.construct_tape(qnode)(params, *args, **kwargs)
+        ops     = list(tape.operations)
+        present = set(tape.wires)
+
+        channels = _active_channels(cfg)
+        if hasattr(cfg, "_resolve_target_wires"):
+            target_wires = cfg._resolve_target_wires(qnode)
+        else:
+            target_wires = cfg.target_wires if cfg.target_wires is not None else [0]
+        idx = cfg._insertion_index(len(ops)) if hasattr(cfg, "_insertion_index") else len(ops)
+
+        fault_ops = [
+            _CHANNELS[name][0](p, wires=w)
+            for w in target_wires if w in present
+            for name, p in channels.items()
+        ]
+        faulted_tape = type(tape)(ops[:idx] + fault_ops + ops[idx:],
+                                  tape.measurements, shots=tape.shots)
+
+        fig, ax = qml.drawer.tape_mpl(faulted_tape)
+        chan_s = ", ".join(f"{k}(p={v})" for k, v in channels.items()) or "no faults"
+        ax.set_title(f"Faulted circuit — {cfg.name}  [{chan_s}, {_insert_label(cfg)}]")
+
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"Saved figure to {save_path}")
+        plt.show()
+        return fig, ax
