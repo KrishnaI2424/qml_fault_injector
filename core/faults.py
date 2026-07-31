@@ -7,12 +7,31 @@ import itertools
 import warnings
 
 
-# Map each logical fault channel to (exact density-matrix op, stochastic Pauli op).
+# Single-qubit Paulis by letter, used to materialize stochastic realizations.
+_PAULIS = {"X": qml.PauliX, "Y": qml.PauliY, "Z": qml.PauliZ}
+
+# Map each logical fault channel to (exact density-matrix op, stochastic
+# decomposition). The decomposition lists ``(pauli_letter, conditional_prob)``
+# outcomes *given the channel fired* (conditional probs sum to 1): a channel
+# with total probability p applies Pauli P_i with probability
+# p * conditional_prob_i. This matches PennyLane's channel conventions —
+# e.g. ``qml.DepolarizingChannel(p)`` applies each of X, Y, Z with
+# probability p/3 and leaves the state untouched with probability 1 - p.
 # Adding a new channel here is the only change needed to support it everywhere.
 _CHANNELS = {
-    "bit_flip":   (qml.BitFlip,   qml.PauliX),
-    "phase_flip": (qml.PhaseFlip, qml.PauliZ),
+    "bit_flip":     (qml.BitFlip,             (("X", 1.0),)),
+    "phase_flip":   (qml.PhaseFlip,           (("Z", 1.0),)),
+    "depolarizing": (qml.DepolarizingChannel, (("X", 1 / 3), ("Y", 1 / 3), ("Z", 1 / 3))),
 }
+
+
+def _sample_pauli(rng, name):
+    """Draw one Pauli letter from a fired channel's conditional decomposition."""
+    decomp = _CHANNELS[name][1]
+    if len(decomp) == 1:
+        return decomp[0][0]
+    letters, probs = zip(*decomp)
+    return letters[rng.choice(len(letters), p=np.asarray(probs) / sum(probs))]
 
 
 @dataclass
@@ -20,20 +39,23 @@ class FaultRealization:
     """One sampled Pauli fault pattern, held fixed for one optimizer step.
 
     ``fired`` lists which channel from ``_CHANNELS`` fired on which of the
-    config's target wires: e.g. ``[("bit_flip", 0), ("bit_flip", 3)]``.
+    config's target wires, and which Pauli it collapsed to:
+    e.g. ``[("bit_flip", 0, "X"), ("depolarizing", 3, "Y")]``. The Pauli is
+    recorded explicitly because multi-outcome channels (depolarizing) cannot
+    be reconstructed from channel name + wire alone.
     """
     step_index: int
-    fired: List[Tuple[str, int]]
+    fired: List[Tuple[str, int, str]]
 
     def pauli_ops(self):
         """Materialise the realized faults as non-parameterized Pauli gates."""
-        return [_CHANNELS[name][1](wires=w) for name, w in self.fired]
+        return [_PAULIS[pauli](wires=w) for _name, w, pauli in self.fired]
 
     def as_dict(self):
         """JSON-safe representation for logging."""
         return {
             "step_index": self.step_index,
-            "fired": [[name, int(w)] for name, w in self.fired],
+            "fired": [[name, int(w), pauli] for name, w, pauli in self.fired],
         }
 
 
@@ -48,6 +70,7 @@ class FaultConfig:
     name: str = "baseline"
     bit_flip_p: float = 0.0
     phase_flip_p: float = 0.0
+    depolarizing_p: float = 0.0   # total channel prob; each Pauli fires with p/3
     target_wires: Optional[List[int]] = None
 
     mode: str = "exact"               # "exact" | "stochastic"
@@ -65,8 +88,9 @@ class FaultConfig:
     def _active_channels(self) -> Dict[str, float]:
         return {
             name: p for name, p in (
-                ("bit_flip",   self.bit_flip_p),
-                ("phase_flip", self.phase_flip_p),
+                ("bit_flip",     self.bit_flip_p),
+                ("phase_flip",   self.phase_flip_p),
+                ("depolarizing", self.depolarizing_p),
             ) if p > 0.0
         }
 
@@ -83,7 +107,8 @@ class FaultConfig:
         convenience. Extra kwargs (e.g. ``target_wires``, ``insert_after``) pass
         through for callers who want a placeholder they can later flip on.
         """
-        return cls(name=name, bit_flip_p=0.0, phase_flip_p=0.0, **kwargs)
+        return cls(name=name, bit_flip_p=0.0, phase_flip_p=0.0,
+                   depolarizing_p=0.0, **kwargs)
 
     def apply_classical_faults(self, weights):
         """No classical faults in this version — pass through cleanly.
@@ -199,12 +224,12 @@ class FaultConfig:
       insert_idx_fn = self._insertion_index
 
       def _pattern_transform(fired_ops):
-          # fired_ops: list of (wire, pauli_class) inserted deterministically
+          # fired_ops: list of (wire, pauli_letter) inserted deterministically
           @qml.transform
           def _inject(tape):
               ops = list(tape.operations)
               idx = insert_idx_fn(len(ops))
-              faults = [cls(wires=w) for (w, cls) in fired_ops]
+              faults = [_PAULIS[pauli](wires=w) for (w, pauli) in fired_ops]
               new_ops = ops[:idx] + faults + ops[idx:]
               return [type(tape)(new_ops, tape.measurements, shots=tape.shots)], lambda r: r[0]
           return _inject
@@ -216,18 +241,35 @@ class FaultConfig:
                   warnings.warn(f"target wire {w} not used by circuit; skipped.", stacklevel=2)
                   continue
               for name in channels:
-                  events.append((w, _CHANNELS[name][1], channels[name]))
+                  events.append((w, name, channels[name]))
           return events
 
+      def _n_patterns(events):
+          # Each event contributes (1 + #decomposition outcomes) branches:
+          # "did not fire" plus one branch per Pauli it can collapse to.
+          n = 1
+          for (_w, name, _p) in events:
+              n *= 1 + len(_CHANNELS[name][1])
+          return n
+
       def _make_enumerated(events):
+          # Per-event outcome list: None ("did not fire", weight 1-p) plus one
+          # (wire, pauli) outcome per decomposition entry, weighted by the
+          # channel's total probability times the conditional prob — p/3 per
+          # Pauli for depolarizing, matching qml.DepolarizingChannel exactly.
+          outcome_sets = []
+          for (w, name, p) in events:
+              outcomes = [(None, 1.0 - p)]
+              outcomes += [((w, pauli), p * cond) for pauli, cond in _CHANNELS[name][1]]
+              outcome_sets.append(outcomes)
+
           patterns = []  # (transformed_qnode, probability_weight)
-          for bits in itertools.product([0, 1], repeat=len(events)):
+          for combo in itertools.product(*outcome_sets):
               fired, weight = [], 1.0
-              for bit, (w, cls, p) in zip(bits, events):
-                  if bit:
-                      fired.append((w, cls)); weight *= p
-                  else:
-                      weight *= (1.0 - p)
+              for outcome, wt in combo:
+                  weight *= wt
+                  if outcome is not None:
+                      fired.append(outcome)
               patterns.append((_pattern_transform(fired)(rebuilt), weight))
 
           def call(*a, **k):
@@ -243,7 +285,8 @@ class FaultConfig:
           def call(*a, **k):
               total = None
               for _ in range(n_trials):
-                  fired = [(w, cls) for (w, cls, p) in events if rng.random() < p]
+                  fired = [(w, _sample_pauli(rng, name))
+                           for (w, name, p) in events if rng.random() < p]
                   qn = _pattern_transform(fired)(rebuilt)
                   r = np.asarray(qn(*a, **k), dtype=float)
                   total = r if total is None else total + r
@@ -259,7 +302,7 @@ class FaultConfig:
           if state["caller"] is None:
               tape = qml.workflow.construct_tape(rebuilt)(*a, **k)
               events = _build_events(set(tape.wires))
-              if 2 ** len(events) <= n_trials:
+              if _n_patterns(events) <= n_trials:
                   state["caller"] = _make_enumerated(events)
               else:
                   state["caller"] = _make_sampled(events)
@@ -333,14 +376,16 @@ class FaultTrainingSession:
             idx = insert_idx_fn(len(ops))
             fault_ops = []
             if session._current is not None:
-                for name, w in session._current.fired:
+                # The realization carries the concrete Pauli letter: a
+                # depolarizing fault cannot be re-derived from name + wire.
+                for _name, w, pauli in session._current.fired:
                     if w not in present:
                         warnings.warn(
                             f"target wire {w} is not used by the circuit; "
                             f"no fault injected there.", stacklevel=2,
                         )
                         continue
-                    fault_ops.append(_CHANNELS[name][1](wires=w))
+                    fault_ops.append(_PAULIS[pauli](wires=w))
             new_ops = ops[:idx] + fault_ops + ops[idx:]
             new_tape = type(tape)(new_ops, tape.measurements, shots=tape.shots)
             return [new_tape], lambda res: res[0]
@@ -351,8 +396,15 @@ class FaultTrainingSession:
         self.recorder = ResultRecorder()
 
     def new_step(self):
-        """Draw a fresh fault realization from the config RNG."""
-        fired = [(name, w) for (w, name, p) in self._events if self._rng.random() < p]
+        """Draw a fresh fault realization from the config RNG.
+
+        Each event fires with its channel's total probability; a fired event
+        then collapses to one Pauli from the channel's conditional
+        decomposition (always X for bit_flip, Z for phase_flip; uniform over
+        X/Y/Z for depolarizing — i.e. p/3 each, PennyLane's convention).
+        """
+        fired = [(name, w, _sample_pauli(self._rng, name))
+                 for (w, name, p) in self._events if self._rng.random() < p]
         self._current = FaultRealization(step_index=self._step_count, fired=fired)
         self._step_count += 1
         return self._current
