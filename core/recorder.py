@@ -11,8 +11,9 @@ def _active_channels(cfg):
         return cfg._active_channels()
     return {
         name: p for name, p in (
-            ("bit_flip",   getattr(cfg, "bit_flip_p",   0.0)),
-            ("phase_flip", getattr(cfg, "phase_flip_p", 0.0)),
+            ("bit_flip",     getattr(cfg, "bit_flip_p",     0.0)),
+            ("phase_flip",   getattr(cfg, "phase_flip_p",   0.0)),
+            ("depolarizing", getattr(cfg, "depolarizing_p", 0.0)),
         ) if p > 0.0
     }
 
